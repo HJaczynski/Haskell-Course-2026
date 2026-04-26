@@ -156,9 +156,12 @@ instance Applicative ZipList where
     ZipList fs <*> ZipList xs = ZipList (zipWith ($) fs xs)
 
 -- 6c) 
--- ZipList cannot have a lawful Monad instance because (>>=) must decide
--- how to combine lists that can have different lengths. That breaks the
--- positional behaviour that ZipList uses for Applicative.
+-- ZipList cannot have a Monad instance whose Applicative instance is the
+-- positional one above. A Monad determines Applicative via ap, so (<*>)
+-- would have to behave like monadic sequencing. But (>>=) has no lawful way
+-- to preserve the original element positions when the function returns lists
+-- of different lengths, so it cannot produce the zipping behaviour required
+-- by this Applicative instance.
 
 main :: IO ()
 main = do
