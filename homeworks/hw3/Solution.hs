@@ -155,6 +155,10 @@ instance Applicative ZipList where
     pure x = ZipList (repeat x)
     ZipList fs <*> ZipList xs = ZipList (zipWith ($) fs xs)
 
+-- 6c) 
+-- ZipList cannot have a lawful Monad instance because (>>=) must decide
+-- how to combine lists that can have different lengths. That breaks the
+-- positional behaviour that ZipList uses for Applicative.
 
 main :: IO ()
 main = do
