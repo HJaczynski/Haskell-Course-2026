@@ -1,10 +1,13 @@
 module SpreadsheetLang where
 
 import Control.Applicative (Alternative(..), optional)
-import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, toLower, toUpper)
-import Data.List (intercalate)
+import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, ord, toLower, toUpper)
+import Data.Graph (SCC(..), stronglyConnComp)
+import Data.List (foldl', intercalate)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 data Sheet = Sheet
     { sheetCells :: Map Addr Content
@@ -376,3 +379,182 @@ formatValues values =
         [ showAddr addr ++ " = " ++ show value
         | (addr, value) <- Map.toAscList values
         ]
+
+dependencies :: Content -> Set Addr
+dependencies (Lit _) = Set.empty
+dependencies (Form expr) = exprDependencies expr
+
+exprDependencies :: Expr -> Set Addr
+exprDependencies (LitE _) = Set.empty
+exprDependencies (Ref addr) = Set.singleton addr
+exprDependencies (BinOp _ left right) =
+    Set.union (exprDependencies left) (exprDependencies right)
+exprDependencies (RangeOp _ start end) =
+    Set.fromList (rangeAddresses start end)
+
+dependencyGraph :: Sheet -> Map Addr (Set Addr)
+dependencyGraph (Sheet cells) = Map.map dependencies cells
+
+dependenciesInSheet :: Sheet -> Map Addr (Set Addr)
+dependenciesInSheet sheet@(Sheet cells) =
+    Map.map (Set.filter (`Map.member` cells)) (dependencyGraph sheet)
+
+dependentsGraph :: Sheet -> Map Addr (Set Addr)
+dependentsGraph sheet =
+    Map.foldlWithKey' addDependents emptyGraph (dependencyGraph sheet)
+  where
+    emptyGraph = Map.fromSet (const Set.empty) (Map.keysSet (sheetCells sheet))
+
+    addDependents graph addr deps =
+        Set.foldl' (\acc dep -> Map.insertWith Set.union dep (Set.singleton addr) acc) graph deps
+
+cycleCells :: Sheet -> Set Addr
+cycleCells sheet =
+    Set.fromList (concatMap fromComponent components)
+  where
+    directDeps = dependenciesInSheet sheet
+    components =
+        stronglyConnComp
+            [ (addr, addr, Set.toList deps)
+            | (addr, deps) <- Map.toAscList directDeps
+            ]
+
+    fromComponent (CyclicSCC addrs) = addrs
+    fromComponent (AcyclicSCC addr)
+        | Set.member addr (Map.findWithDefault Set.empty addr directDeps) = [addr]
+        | otherwise = []
+
+evaluationOrder :: Sheet -> Either [Addr] [Addr]
+evaluationOrder sheet
+    | Set.null cycles = Right (topologicalOrderIgnoring sheet Set.empty)
+    | otherwise = Left (Set.toAscList cycles)
+  where
+    cycles = cycleCells sheet
+
+evaluateText :: String -> Either ParseError (Map Addr Value)
+evaluateText input = evaluateSheet <$> parseSheet input
+
+evaluateSheet :: Sheet -> Map Addr Value
+evaluateSheet sheet@(Sheet cells) =
+    foldl' evaluateOne initialValues order
+  where
+    cycles = cycleCells sheet
+    initialValues = Map.fromSet (const (ErrV "cycle")) cycles
+    order = topologicalOrderIgnoring sheet cycles
+
+    evaluateOne values addr =
+        case Map.lookup addr cells of
+            Nothing -> values
+            Just content -> Map.insert addr (evalContent sheet values content) values
+
+evalContent :: Sheet -> Map Addr Value -> Content -> Value
+evalContent _ _ (Lit value) = value
+evalContent sheet values (Form expr) = evalExpr sheet values expr
+
+evalExpr :: Sheet -> Map Addr Value -> Expr -> Value
+evalExpr _ _ (LitE value) = value
+evalExpr sheet values (Ref addr)
+    | Map.member addr (sheetCells sheet) =
+        Map.findWithDefault (ErrV ("unresolved cell " ++ showAddr addr)) addr values
+    | otherwise = ErrV ("missing cell " ++ showAddr addr)
+evalExpr sheet values (BinOp op left right) =
+    applyOp op (evalExpr sheet values left) (evalExpr sheet values right)
+evalExpr sheet values (RangeOp op start end) =
+    applyRangeOp op (map (evalExpr sheet values . Ref) (rangeAddresses start end))
+
+applyOp :: Op -> Value -> Value -> Value
+applyOp _ (ErrV message) _ = ErrV message
+applyOp _ _ (ErrV message) = ErrV message
+applyOp Add (NumV left) (NumV right) = NumV (left + right)
+applyOp Sub (NumV left) (NumV right) = NumV (left - right)
+applyOp Mul (NumV left) (NumV right) = NumV (left * right)
+applyOp Div (NumV _) (NumV 0) = ErrV "division by zero"
+applyOp Div (NumV left) (NumV right) = NumV (left / right)
+applyOp _ _ _ = ErrV "type error: arithmetic expects numbers"
+
+applyRangeOp :: RangeOp -> [Value] -> Value
+applyRangeOp op values =
+    case collectNumbers values of
+        Left err -> err
+        Right nums -> evalRangeNumbers op nums
+
+collectNumbers :: [Value] -> Either Value [Double]
+collectNumbers = foldr collectOne (Right [])
+  where
+    collectOne (NumV number) (Right numbers) = Right (number : numbers)
+    collectOne (ErrV message) _ = Left (ErrV message)
+    collectOne _ _ = Left (ErrV "type error: range expects numbers")
+
+evalRangeNumbers :: RangeOp -> [Double] -> Value
+evalRangeNumbers SumR nums = NumV (sum nums)
+evalRangeNumbers AvgR [] = ErrV "empty range"
+evalRangeNumbers AvgR nums = NumV (sum nums / fromIntegral (length nums))
+
+topologicalOrderIgnoring :: Sheet -> Set Addr -> [Addr]
+topologicalOrderIgnoring sheet@(Sheet cells) ignored =
+    go initialReady initialIndegrees []
+  where
+    activeCells = Map.keysSet cells `Set.difference` ignored
+    activeDeps =
+        Map.map
+            (Set.filter (`Set.member` activeCells))
+            (Map.restrictKeys (dependenciesInSheet sheet) activeCells)
+    initialIndegrees = Map.map Set.size activeDeps
+    initialReady =
+        Map.keysSet (Map.filter (== 0) initialIndegrees)
+    reverseGraph =
+        Map.foldlWithKey' addReverseDeps (Map.fromSet (const Set.empty) activeCells) activeDeps
+
+    addReverseDeps graph addr deps =
+        Set.foldl' (\acc dep -> Map.insertWith Set.union dep (Set.singleton addr) acc) graph deps
+
+    go ready indegrees ordered
+        | Set.null ready = reverse ordered
+        | otherwise =
+            let (addr, restReady) = Set.deleteFindMin ready
+                dependents = Map.findWithDefault Set.empty addr reverseGraph
+                (nextReady, nextIndegrees) =
+                    Set.foldl'
+                        releaseDependent
+                        (restReady, Map.delete addr indegrees)
+                        dependents
+            in go nextReady nextIndegrees (addr : ordered)
+
+    releaseDependent (ready, indegrees) addr =
+        case Map.lookup addr indegrees of
+            Nothing -> (ready, indegrees)
+            Just count ->
+                let nextCount = count - 1
+                    nextIndegrees = Map.insert addr nextCount indegrees
+                    nextReady =
+                        if nextCount == 0
+                            then Set.insert addr ready
+                            else ready
+                in (nextReady, nextIndegrees)
+
+rangeAddresses :: Addr -> Addr -> [Addr]
+rangeAddresses (Addr startCol startRow) (Addr endCol endRow) =
+    [ Addr (columnName col) row
+    | col <- [min startColNumber endColNumber .. max startColNumber endColNumber]
+    , row <- [min startRow endRow .. max startRow endRow]
+    ]
+  where
+    startColNumber = columnNumber startCol
+    endColNumber = columnNumber endCol
+
+columnNumber :: String -> Int
+columnNumber =
+    foldl' (\acc c -> acc * 26 + alphaOffset (toUpper c)) 0
+  where
+    alphaOffset c = ord c - ord 'A' + 1
+
+columnName :: Int -> String
+columnName number
+    | number <= 0 = ""
+    | otherwise = reverse (go number)
+  where
+    go 0 = []
+    go n =
+        let (q, r) = (n - 1) `quotRem` 26
+            letter = toEnum (ord 'A' + r)
+        in letter : go q
