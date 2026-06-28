@@ -42,6 +42,10 @@ tests =
     , testCycleDoesNotHang
     , testRecomputeNoChangeInvariant
     , testOrderIndependenceInvariant
+    , testAffectedCells
+    , testReactiveMatchesFullEvaluation
+    , testReactiveLeavesUnrelatedValues
+    , testReactiveCanCreateCycle
     ]
 
 testParserCellsAndComments :: Test
@@ -168,6 +172,67 @@ testOrderIndependenceInvariant =
         first <- evalOk "sheet { A1 = 1; A2 = A1 + 2; A3 = A2 * 3; }"
         second <- evalOk "sheet { A3 = A2 * 3; A2 = A1 + 2; A1 = 1; }"
         assertEqual "same values" first second
+    )
+
+testAffectedCells :: Test
+testAffectedCells =
+    ( "reactive dependency closure finds exactly transitive dependents"
+    , do
+        sheet <- parseOk "sheet { A1 = 1; A2 = A1 + 1; A3 = A2 + 1; B1 = 7; B2 = B1 + A3; C1 = 4; }"
+        assertEqual
+            "affected by A1"
+            (Set.fromList [addr "A" 1, addr "A" 2, addr "A" 3, addr "B" 2])
+            (affectedCells sheet (addr "A" 1))
+    )
+
+testReactiveMatchesFullEvaluation :: Test
+testReactiveMatchesFullEvaluation =
+    ( "reactive recalculation matches full evaluation"
+    , do
+        sheet <- parseOk "sheet { A1 = 1; A2 = A1 + 2; A3 = A2 * 3; B1 = 10; }"
+        let oldValues = evaluateSheet sheet
+        let result = recalculateAfterChange (addr "A" 1) (Lit (NumV 5)) sheet oldValues
+        assertEqual
+            "recalculated cells"
+            (Set.fromList [addr "A" 1, addr "A" 2, addr "A" 3])
+            (recalculatedCells result)
+        assertEqual
+            "same as full evaluation"
+            (evaluateSheet (recalculatedSheet result))
+            (recalculatedValues result)
+    )
+
+testReactiveLeavesUnrelatedValues :: Test
+testReactiveLeavesUnrelatedValues =
+    ( "reactive recalculation leaves unrelated cached values alone"
+    , do
+        sheet <- parseOk "sheet { A1 = 1; A2 = A1 + 1; B1 = 100; B2 = B1 + 1; C1 = A2 + B2; D1 = 7; }"
+        let oldValues = evaluateSheet sheet
+        let result = recalculateAfterChange (addr "B" 1) (Lit (NumV 200)) sheet oldValues
+        let newValues = recalculatedValues result
+        assertEqual
+            "recalculated cells"
+            (Set.fromList [addr "B" 1, addr "B" 2, addr "C" 1])
+            (recalculatedCells result)
+        forM_ [addr "A" 1, addr "A" 2, addr "D" 1] $ \cell ->
+            assertEqual ("unchanged " ++ showAddr cell) (Map.lookup cell oldValues) (Map.lookup cell newValues)
+    )
+
+testReactiveCanCreateCycle :: Test
+testReactiveCanCreateCycle =
+    ( "reactive recalculation handles an update that creates a cycle"
+    , do
+        sheet <- parseOk "sheet { A1 = 1; A2 = A1 + 1; B1 = 5; }"
+        let oldValues = evaluateSheet sheet
+        let result = recalculateAfterChange (addr "A" 1) (Form (Ref (addr "A" 2))) sheet oldValues
+        let newValues = recalculatedValues result
+        assertEqual "A1" (Just (ErrV "cycle")) (Map.lookup (addr "A" 1) newValues)
+        assertEqual "A2" (Just (ErrV "cycle")) (Map.lookup (addr "A" 2) newValues)
+        assertEqual "B1" (Just (NumV 5)) (Map.lookup (addr "B" 1) newValues)
+        assertEqual
+            "same as full evaluation"
+            (evaluateSheet (recalculatedSheet result))
+            newValues
     )
 
 sampleSheet :: String

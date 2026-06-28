@@ -49,6 +49,12 @@ data Op = Add | Sub | Mul | Div
 data RangeOp = SumR | AvgR
     deriving (Eq, Show)
 
+data RecalcResult = RecalcResult
+    { recalculatedSheet :: Sheet
+    , recalculatedValues :: Map Addr Value
+    , recalculatedCells :: Set Addr
+    } deriving (Eq, Show)
+
 data ParseError = ParseError
     { errorLine :: Int
     , errorColumn :: Int
@@ -447,6 +453,53 @@ evaluateSheet sheet@(Sheet cells) =
             Nothing -> values
             Just content -> Map.insert addr (evalContent sheet values content) values
 
+setCell :: Addr -> Content -> Sheet -> Sheet
+setCell addr content (Sheet cells) =
+    Sheet (Map.insert addr content cells)
+
+affectedCells :: Sheet -> Addr -> Set Addr
+affectedCells sheet start =
+    go Set.empty (Set.singleton start)
+  where
+    graph = dependentsGraph sheet
+
+    go seen pending =
+        case Set.minView pending of
+            Nothing -> seen
+            Just (addr, rest)
+                | Set.member addr seen -> go seen rest
+                | otherwise ->
+                    let directDependents = Map.findWithDefault Set.empty addr graph
+                    in go (Set.insert addr seen) (Set.union rest directDependents)
+
+recalculateAfterChange :: Addr -> Content -> Sheet -> Map Addr Value -> RecalcResult
+recalculateAfterChange addr content sheet values =
+    RecalcResult
+        { recalculatedSheet = updatedSheet
+        , recalculatedValues = recalculateCells updatedSheet values targets
+        , recalculatedCells = targets
+        }
+  where
+    updatedSheet = setCell addr content sheet
+    targets = affectedCells updatedSheet addr
+
+recalculateCells :: Sheet -> Map Addr Value -> Set Addr -> Map Addr Value
+recalculateCells sheet@(Sheet cells) values targets =
+    foldl' evaluateOne initialValues order
+  where
+    cycles = Set.intersection targets (cycleCells sheet)
+    initialValues = Map.union (Map.fromSet (const (ErrV "cycle")) cycles) values
+    order = topologicalOrderFor sheet cycles targets
+
+    evaluateOne currentValues addr =
+        case Map.lookup addr cells of
+            Nothing -> Map.delete addr currentValues
+            Just content -> Map.insert addr (evalContent sheet currentValues content) currentValues
+
+recalculationOrder :: Sheet -> Set Addr -> [Addr]
+recalculationOrder sheet targets =
+    topologicalOrderFor sheet (Set.intersection targets (cycleCells sheet)) targets
+
 evalContent :: Sheet -> Map Addr Value -> Content -> Value
 evalContent _ _ (Lit value) = value
 evalContent sheet values (Form expr) = evalExpr sheet values expr
@@ -492,9 +545,13 @@ evalRangeNumbers AvgR nums = NumV (sum nums / fromIntegral (length nums))
 
 topologicalOrderIgnoring :: Sheet -> Set Addr -> [Addr]
 topologicalOrderIgnoring sheet@(Sheet cells) ignored =
+    topologicalOrderFor sheet ignored (Map.keysSet cells)
+
+topologicalOrderFor :: Sheet -> Set Addr -> Set Addr -> [Addr]
+topologicalOrderFor sheet@(Sheet cells) ignored targets =
     go initialReady initialIndegrees []
   where
-    activeCells = Map.keysSet cells `Set.difference` ignored
+    activeCells = Set.intersection targets (Map.keysSet cells) `Set.difference` ignored
     activeDeps =
         Map.map
             (Set.filter (`Set.member` activeCells))
